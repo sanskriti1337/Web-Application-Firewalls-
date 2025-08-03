@@ -1,0 +1,177 @@
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+from abc import ABC, abstractmethod
+from collections import deque
+from datetime import datetime
+from urllib.parse import quote
+import requests
+import threading
+# Abstract base class for Testers
+class TesterBase(ABC):
+    def __init__(self, base_url, paths, output_widget):
+        self._base_url = base_url.rstrip('/')
+        self._paths_queue = deque(paths)
+        self._output = output_widget
+        self._results = []  # Store results for sorting/searching
+    @abstractmethod
+    def run_test(self):
+        pass
+    def log(self, message):
+        self._output.insert(tk.END, message + "\n")
+        self._output.see(tk.END)
+    def get_results(self):
+        return self._results
+    def search_results(self, status_code=None, keyword=None):
+        results = self._results
+        if status_code:
+            results = [r for r in results if r['status'] == status_code]
+        if keyword:
+            results = [r for r in results if keyword.lower() in r['url'].lower()]
+        return results
+    def sort_results(self, key='time', reverse=False):
+        self._results.sort(key=lambda r: r.get(key, 0), reverse=reverse)
+# FirewallTester subclass
+class FirewallTester(TesterBase):
+    def __init__(self, base_url, paths, output_widget, use_headers=False, fuzz_payloads=False):
+        super().__init__(base_url, paths, output_widget)
+        self._use_headers = use_headers
+        self._fuzz_payloads = fuzz_payloads
+        self._custom_headers = {
+            "User-Agent": "Mozilla/5.0 (FirewallTester/1.0)",
+            "X-Forwarded-For": "127.0.0.1",
+            "X-Original-URL": "/admin",
+            "X-Test-Bypass": "true"
+        }
+        self._payloads = ["../", "%00", "<script>alert(1)</script>", "?cmd=ls", "admin' OR 1=1--", "phpinfo.php"]
+    def run_test(self):
+        self.log("-" * 80)
+        self.log(f"[+] Web Firewall Tester started at {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        self.log("-" * 80)
+        headers = self._custom_headers if self._use_headers else {"User-Agent": "Mozilla/5.0"}
+        # Build queue with fuzzed paths if needed
+        if self._fuzz_payloads:
+            for path in list(self._paths_queue):
+                for payload in self._payloads:
+                    fuzzed = path + quote(payload)
+                    self._paths_queue.append(fuzzed)
+        visited = set()
+        while self._paths_queue:
+            path = self._paths_queue.popleft()
+            full_url = f"{self._base_url}/{path.lstrip('/')}"
+            if full_url in visited:
+                continue
+            visited.add(full_url)
+            try:
+                start = datetime.now()
+                response = requests.get(full_url, headers=headers, timeout=5)
+                elapsed = (datetime.now() - start).total_seconds()
+                line = f"[+] {full_url} -> Status: {response.status_code}, Size: {len(response.content)} B, Time: {elapsed:.2f}s"
+                self.log(line)
+                # Store result for sorting/searching
+                self._results.append({
+                    'url': full_url,
+                    'status': response.status_code,
+                    'size': len(response.content),
+                    'time': elapsed
+                })
+            except requests.exceptions.RequestException as e:
+                self.log(f"[-] {full_url} -> Error: {e}")
+        self.log("-" * 80)
+        self.log("[✓] Testing Complete.")
+# Tkinter GUI class with encapsulated attributes
+class FirewallTesterGUI:
+    def __init__(self, root):
+        self._root = root
+        self._root.title("Advanced Web Firewall Tester ")
+        self._root.geometry("900x600")
+        # GUI Widgets
+        self._create_widgets()
+        self._tester = None
+    def _create_widgets(self):
+        tk.Label(self._root, text="Target URL (e.g., https://example.com):").pack()
+        self._url_entry = tk.Entry(self._root, width=80)
+        self._url_entry.pack(pady=3)
+        tk.Label(self._root, text="Paths to test (comma-separated, optional):").pack()
+        self._paths_entry = tk.Entry(self._root, width=80)
+        self._paths_entry.pack(pady=3)
+        self._header_var = tk.BooleanVar()
+        self._payload_var = tk.BooleanVar()
+        tk.Checkbutton(self._root, text="Use Custom Headers (WAF bypass)", variable=self._header_var).pack()
+        tk.Checkbutton(self._root, text="Inject Ethical Payloads", variable=self._payload_var).pack()
+        self._start_btn = tk.Button(self._root, text="Start Testing", bg="navy", fg="white",
+                              command=self._start_test_thread)
+        self._start_btn.pack(pady=10)
+        self._output_text = scrolledtext.ScrolledText(self._root, width=110, height=25, font=("Courier", 10))
+        self._output_text.pack(pady=5)
+        # Sorting and Searching controls
+        frame = tk.Frame(self._root)
+        frame.pack(pady=10)
+        tk.Label(frame, text="Sort results by:").grid(row=0, column=0, sticky="w")
+        self._sort_key_var = tk.StringVar(value="time")
+        tk.OptionMenu(frame, self._sort_key_var, "time", "status", "size").grid(row=0, column=1)
+        tk.Label(frame, text="Search by status code:").grid(row=1, column=0, sticky="w")
+        self._search_status_entry = tk.Entry(frame, width=10)
+        self._search_status_entry.grid(row=1, column=1)
+        tk.Label(frame, text="Search by keyword in URL:").grid(row=2, column=0, sticky="w")
+        self._search_keyword_entry = tk.Entry(frame, width=30)
+        self._search_keyword_entry.grid(row=2, column=1)
+        tk.Button(frame, text="Sort Results", command=self._sort_results).grid(row=3, column=0, pady=5)
+        tk.Button(frame, text="Search Results", command=self._search_results).grid(row=3, column=1, pady=5)
+        tk.Button(frame, text="Clear Output", command=self._clear_output).grid(row=3, column=2, pady=5)
+    def _start_test_thread(self):
+        # Disable start button while running
+        self._start_btn.config(state=tk.DISABLED)
+        self._output_text.delete(1.0, tk.END)
+        url = self._url_entry.get().strip()
+        paths_raw = self._paths_entry.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Please enter a URL")
+            self._start_btn.config(state=tk.NORMAL)
+            return
+        paths = [p.strip().lstrip('/') for p in paths_raw.split(',')] if paths_raw else [
+            "admin", "login", "wp-login", ".git", "phpinfo.php", "dashboard", "robots.txt"
+        ]
+        self._tester = FirewallTester(
+            url,
+            paths,
+            self._output_text,
+            use_headers=self._header_var.get(),
+            fuzz_payloads=self._payload_var.get()
+        )
+        # Run in background thread to keep GUI responsive
+        threading.Thread(target=self._run_tests).start()
+    def _run_tests(self):
+        self._tester.run_test()
+        self._start_btn.config(state=tk.NORMAL)
+    def _sort_results(self):
+        if not self._tester:
+            messagebox.showinfo("Info", "Run a test first.")
+            return
+        key = self._sort_key_var.get()
+        self._tester.sort_results(key=key)
+        self._display_results(self._tester.get_results())
+    def _search_results(self):
+        if not self._tester:
+            messagebox.showinfo("Info", "Run a test first.")
+            return
+        status_text = self._search_status_entry.get().strip()
+        keyword = self._search_keyword_entry.get().strip()
+        status_code = int(status_text) if status_text.isdigit() else None
+        filtered = self._tester.search_results(status_code=status_code, keyword=keyword)
+        self._display_results(filtered)
+    def _display_results(self, results):
+        self._output_text.delete(1.0, tk.END)
+        for r in results:
+            line = f"{r['url']} -> Status: {r['status']}, Size: {r['size']} B, Time: {r['time']:.2f}s"
+            self._output_text.insert(tk.END, line + "\n")
+        self._output_text.see(tk.END)
+    def _clear_output(self):
+        self._output_text.delete(1.0, tk.END)
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FirewallTesterGUI(root)
+    root.mainloop()
+
+
+
+
